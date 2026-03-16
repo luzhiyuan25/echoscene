@@ -22,16 +22,16 @@ from omegaconf import OmegaConf
 import json
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', required=False, type=str, default="/media/ymxlzgy/Data/Dataset/FRONT", help="dataset path")
+parser.add_argument('--dataset', required=False, type=str, default="/data1/luzhiyuan2025/echoscene", help="dataset path")
 parser.add_argument('--with_CLIP', type=bool_flag, default=True, help="Load Feats directly instead of points.")
 
 parser.add_argument('--manipulate', default=True, type=bool_flag)
-parser.add_argument('--exp', default='../experiments/layout_test', help='experiment name')
-parser.add_argument('--epoch', type=str, default='100', help='saved epoch')
-parser.add_argument('--render_type', type=str, default='txt2shape', help='retrieval, txt2shape, onlybox, echoscene')
+parser.add_argument('--exp', default='/data1/luzhiyuan2025/echoscene/exp/test', help='experiment name')
+parser.add_argument('--epoch', type=str, default='3000', help='saved epoch')
+parser.add_argument('--render_type', type=str, default='onlybox', help='retrieval, txt2shape, onlybox, echoscene')
 parser.add_argument('--gen_shape', default=False, type=bool_flag, help='infer diffusion')
-parser.add_argument('--visualize', default=False, type=bool_flag)
-parser.add_argument('--export_3d', default=False, type=bool_flag, help='Export the generated shapes and boxes in json files for future use')
+parser.add_argument('--visualize', default=True, type=bool_flag)
+parser.add_argument('--export_3d', default=True, type=bool_flag, help='Export the generated shapes and boxes in json files for future use')
 parser.add_argument('--room_type', default='all', help='all, bedroom, livingroom, diningroom, library')
 
 args = parser.parse_args()
@@ -59,6 +59,129 @@ def normalize(vertices, scale=1):
     vertices = vertices / scalars * scale
     return vertices
 
+def _tensor_to_list(value):
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    return value
+
+def _build_object_entries(obj_ids, obj_classes):
+    entries = []
+    for idx, obj_id in enumerate(obj_ids):
+        class_name = obj_classes[int(obj_id)].strip('\n')
+        entries.append({
+            "index": idx,
+            "class_id": int(obj_id),
+            "class_name": class_name,
+        })
+    return entries
+
+def _write_layout_json(output_path, payload):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as file:
+        json.dump(payload, file, indent=2)
+
+def _index_tensor_or_array(value, mask):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return value[mask]
+    if isinstance(value, np.ndarray):
+        return value[mask.cpu().numpy()]
+    return value
+
+def _build_keep_mask(num_objs, excluded_indices, device):
+    keep_mask = torch.ones(num_objs, dtype=torch.bool, device=device)
+    if excluded_indices:
+        indices = torch.tensor(sorted(excluded_indices), device=device, dtype=torch.long)
+        keep_mask[indices] = False
+    return keep_mask
+
+
+def _filter_triples(triples, keep_mask):
+    if triples is None or len(triples) == 0:
+        return triples
+    kept_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(1)
+    old_to_new = -torch.ones(keep_mask.shape[0], device=keep_mask.device, dtype=torch.long)
+    old_to_new[kept_indices] = torch.arange(kept_indices.shape[0], device=keep_mask.device, dtype=torch.long)
+    triples = triples.clone()
+    s = triples[:, 0]
+    o = triples[:, 2]
+    valid = keep_mask[s] & keep_mask[o]
+    triples = triples[valid]
+    triples[:, 0] = old_to_new[triples[:, 0]]
+    triples[:, 2] = old_to_new[triples[:, 2]]
+    return triples
+
+def _angular_abs_diff(a, b):
+    diff = torch.abs(a - b)
+    return torch.minimum(diff, 360.0 - diff)
+
+
+def _build_enc_index_map(dec_len, missing_nodes):
+    missing_nodes_sorted = sorted([int(x) for x in missing_nodes])
+    mapping = {}
+    num_missing_before = 0
+    miss_ptr = 0
+    for dec_idx in range(dec_len):
+        while miss_ptr < len(missing_nodes_sorted) and missing_nodes_sorted[miss_ptr] < dec_idx:
+            num_missing_before += 1
+            miss_ptr += 1
+        if miss_ptr < len(missing_nodes_sorted) and missing_nodes_sorted[miss_ptr] == dec_idx:
+            continue
+        mapping[dec_idx] = dec_idx - num_missing_before
+    return mapping
+
+
+
+def _to_serializable_list(x):
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy().tolist()
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, (list, tuple)):
+        return list(x)
+    return x
+
+
+def _dump_layout_exports(export_dir, scan_id, obj_entries, eval_type, enc_objs, enc_triples, dec_objs, dec_triples,
+                         raw_layout_after, processed_layout_after, raw_layout_before=None, processed_layout_before=None,
+                         edit_info=None):
+    os.makedirs(export_dir, exist_ok=True)
+    scan_export_dir = os.path.join(export_dir, str(scan_id))
+    os.makedirs(scan_export_dir, exist_ok=True)
+
+    base_meta = {
+        'scan_id': scan_id,
+        'obj_entries': obj_entries,
+        'eval_type': eval_type,
+        'enc_objs': _to_serializable_list(enc_objs),
+        'enc_triples': _to_serializable_list(enc_triples),
+        'dec_objs': _to_serializable_list(dec_objs),
+        'dec_triples': _to_serializable_list(dec_triples),
+    }
+
+    raw_payload = {**base_meta, 'layout_raw': raw_layout_after}
+    with open(os.path.join(scan_export_dir, 'layout_raw.json'), 'w') as f:
+        json.dump(raw_payload, f, indent=2)
+
+    processed_payload = {**base_meta, 'layout_processed': processed_layout_after}
+    if edit_info is not None:
+        processed_payload['edit_info'] = edit_info
+    with open(os.path.join(scan_export_dir, 'layout_processed.json'), 'w') as f:
+        json.dump(processed_payload, f, indent=2)
+
+    if processed_layout_before is not None:
+        original_payload = {**base_meta, 'layout_original': processed_layout_before}
+        if raw_layout_before is not None:
+            original_payload['layout_original_raw'] = raw_layout_before
+        with open(os.path.join(scan_export_dir, 'layout_original.json'), 'w') as f:
+            json.dump(original_payload, f, indent=2)
+
+
 def validate_constrains_loop_w_changes(modelArgs, testdataset, model, normalized_file=None, bin_angles=False, cat2objs=None, datasize='large', gen_shape=False):
 
     test_dataloader_changes = torch.utils.data.DataLoader(
@@ -74,6 +197,7 @@ def validate_constrains_loop_w_changes(modelArgs, testdataset, model, normalized
     accuracy = {}
     accuracy_unchanged = {}
     accuracy_in_orig_graph = {}
+    before_after_stats = {'center_l2': [], 'size_l1': [], 'angle_abs': []}
 
     for k in ['left', 'right', 'front', 'behind', 'smaller', 'bigger', 'shorter', 'taller', 'standing on', 'close by', 'symmetrical to', 'total']:
         accuracy_in_orig_graph[k] = []
@@ -81,6 +205,8 @@ def validate_constrains_loop_w_changes(modelArgs, testdataset, model, normalized
         accuracy[k] = []
 
     for i, data in enumerate(test_dataloader_changes, 0):
+        # if i >= 2:   # 只跑5个scene
+        #     break
         print(data['scan_id'][0])
 
         try:
@@ -99,6 +225,8 @@ def validate_constrains_loop_w_changes(modelArgs, testdataset, model, normalized
                 dec_sdfs = data['decoder']['sdfs']
 
             missing_nodes = data['missing_nodes']
+            missing_nodes_decoder = data.get('missing_nodes_decoder', [])
+            manipulate_type = data.get('manipulate_type', [])
             manipulated_subs = data['manipulated_subs']
             manipulated_objs = data['manipulated_objs']
             manipulated_preds = data['manipulated_preds']
@@ -118,7 +246,7 @@ def validate_constrains_loop_w_changes(modelArgs, testdataset, model, normalized
         all_pred_angles = []
 
         with torch.no_grad():
-            original = 0
+            original = 1
             if original:
                 # original graph
                 print("***original graph***")
@@ -135,18 +263,45 @@ def validate_constrains_loop_w_changes(modelArgs, testdataset, model, normalized
 
             # manipulated graph
             print("***manipulated graph***")
+            print('manipulate type:', manipulate_type)
+            print('missing_nodes (encoder indices):', missing_nodes)
+            print('missing_nodes_decoder (decoder indices):', missing_nodes_decoder)            
             if len(manipulated_subs) and len(manipulated_objs):
                 manipulated_nodes = manipulated_subs + manipulated_objs
                 print('previous:' , obj_classes[enc_objs[manipulated_subs[0]]], pred_classes[manipulated_preds[0]], obj_classes[enc_objs[manipulated_objs[0]]])
+                print('edited nodes (relationship):', manipulated_nodes)
                 keep, data_dict = model.sample_boxes_and_shape_with_changes(enc_objs, enc_triples, encoded_enc_text_feat,
                                                                             encoded_enc_rel_feat, dec_objs, dec_triples,
                                                                             encoded_dec_text_feat, encoded_dec_rel_feat,
                                                                             manipulated_nodes, gen_shape=gen_shape)
             else:
-                keep, data_dict = model.sample_boxes_and_shape_with_additions(enc_objs, enc_triples, encoded_enc_text_feat,
-                                                                              encoded_enc_rel_feat, dec_objs, dec_triples,
-                                                                              encoded_dec_text_feat, encoded_dec_rel_feat,
-                                                                              missing_nodes, gen_shape=gen_shape)
+                # keep, data_dict = model.sample_boxes_and_shape_with_additions(enc_objs, enc_triples, encoded_enc_text_feat,
+                #                                                               encoded_enc_rel_feat, dec_objs, dec_triples,
+                #                                                               encoded_dec_text_feat, encoded_dec_rel_feat,
+                #                                                               missing_nodes, gen_shape=gen_shape)
+                print('edited nodes (additions/removals):', missing_nodes_decoder)
+                additions_result = model.sample_boxes_and_shape_with_additions(enc_objs, enc_triples, encoded_enc_text_feat,
+                                                                                encoded_enc_rel_feat, dec_objs, dec_triples,
+                                                                                encoded_dec_text_feat, encoded_dec_rel_feat,
+                                                                                missing_nodes, gen_shape=gen_shape)
+                if isinstance(additions_result, tuple):
+                    keep, data_dict = additions_result
+                else:
+                    keep = torch.zeros(dec_objs.shape[0], 1, device=dec_objs.device)
+                    data_dict = additions_result
+
+            excluded_indices = set(missing_nodes_decoder)
+            keep_mask = _build_keep_mask(dec_objs.shape[0], excluded_indices, dec_objs.device)
+            if keep_mask is not None:
+                dec_objs = dec_objs[keep_mask]
+                dec_triples = _filter_triples(dec_triples, keep_mask)
+                data_dict = {
+                    **data_dict,
+                    "sizes": _index_tensor_or_array(data_dict.get("sizes"), keep_mask),
+                    "translations": _index_tensor_or_array(data_dict.get("translations"), keep_mask),
+                    "angles": _index_tensor_or_array(data_dict.get("angles"), keep_mask),
+                }
+                keep = _index_tensor_or_array(keep, keep_mask)
 
             boxes_pred, angles_pred = torch.concat((data_dict['sizes'], data_dict['translations']), dim=-1), data_dict['angles']
             shapes_pred = None
@@ -185,8 +340,88 @@ def validate_constrains_loop_w_changes(modelArgs, testdataset, model, normalized
                                 classes=obj_classes, render_type=args.render_type, shapes_pred=shapes_pred, store_img=True,
                                 render_boxes=False, visual=True, demo=True, without_lamp=True,
                                 store_path=modelArgs['store_path']+"_after")
+                elif model.type_ == 'echolayout':
+                    if original:
+                        render_box(data['scan_id'], enc_objs.detach().cpu().numpy(), original_boxes_pred, original_angles_pred,
+                                   datasize=datasize,
+                                   classes=obj_classes, render_type=args.render_type, store_img=True,
+                                   render_boxes=False, visual=True, demo=True, without_lamp=True,
+                                   store_path=modelArgs['store_path']+"_before")
+                    render_box(data['scan_id'], dec_objs.detach().cpu().numpy(), boxes_pred_den, angles_pred,
+                               datasize=datasize,
+                               classes=obj_classes, render_type=args.render_type, store_img=True,
+                               render_boxes=False, visual=True, demo=True, without_lamp=True,
+                               store_path=modelArgs['store_path']+"_after")
+                    # render_box(data['scan_id'], dec_objs.detach().cpu().numpy(), boxes_pred_den, angles_pred,
+                    #            datasize=datasize,
+                    #            classes=obj_classes, render_type=args.render_type, store_img=True,
+                    #            render_boxes=False, visual=True, demo=True, without_lamp=True,
+                    #            store_path=modelArgs['store_path']+"_after")
                 else:
-                    raise NotImplementedError
+                    print(f"[Warning] Unsupported model type for visualization: {model.type_}. Skip visualization.")
+
+
+            if args.export_3d:
+                export_root = os.path.join(modelArgs['store_path'], 'layout_exports', testdataset.eval_type)
+                raw_layout_after = {
+                    'sizes': _to_serializable_list(data_dict['sizes']),
+                    'translations': _to_serializable_list(data_dict['translations']),
+                    'angles': _to_serializable_list(data_dict['angles'])
+                }
+                processed_layout_after = {
+                    'boxes': _to_serializable_list(boxes_pred_den),
+                    'angles': _to_serializable_list(angles_pred),
+                    'keep': _to_serializable_list(keep)
+                }
+                raw_layout_before = None
+                processed_layout_before = None
+                if original:
+                    raw_layout_before = {
+                        'sizes': _to_serializable_list(original_data_dict['sizes']),
+                        'translations': _to_serializable_list(original_data_dict['translations']),
+                        'angles': _to_serializable_list(original_data_dict['angles'])
+                    }
+                    processed_layout_before = {
+                        'boxes': _to_serializable_list(original_boxes_pred),
+                        'angles': _to_serializable_list(original_angles_pred)
+                    }
+
+                edit_type = 'relationship' if (len(manipulated_subs) and len(manipulated_objs)) else 'addition'
+                edit_info = {
+                    'edit_type': edit_type,
+                    'missing_nodes': [int(x) for x in missing_nodes],
+                    'manipulated_subs': [int(x) for x in manipulated_subs],
+                    'manipulated_objs': [int(x) for x in manipulated_objs],
+                    'manipulated_preds': [int(x) for x in manipulated_preds],
+                }
+                obj_entries = _build_object_entries(dec_objs.detach().cpu().numpy(), obj_classes)
+                _dump_layout_exports(
+                    export_dir=export_root,
+                    scan_id=data['scan_id'][0],
+                    obj_entries = obj_entries,
+                    eval_type=testdataset.eval_type,
+                    enc_objs=enc_objs,
+                    enc_triples=enc_triples,
+                    dec_objs=dec_objs,
+                    dec_triples=dec_triples,
+                    raw_layout_after=raw_layout_after,
+                    processed_layout_after=processed_layout_after,
+                    raw_layout_before=raw_layout_before,
+                    processed_layout_before=processed_layout_before,
+                    edit_info=edit_info,
+                )
+                # Export layout-only GLBs for both original and edited layouts
+                glb_export_root = os.path.join(export_root, str(data['scan_id'][0]), 'glb')
+                render_box(data['scan_id'], enc_objs.detach().cpu().numpy(), original_boxes_pred, original_angles_pred,
+                           datasize=datasize,
+                           classes=obj_classes, render_type='onlybox', store_img=False,
+                           render_boxes=False, visual=False, demo=False, without_lamp=True,
+                           str_append='_before', store_path=glb_export_root)
+                render_box(data['scan_id'], dec_objs.detach().cpu().numpy(), boxes_pred_den, angles_pred,
+                           datasize=datasize,
+                           classes=obj_classes, render_type='onlybox', store_img=False,
+                           render_boxes=False, visual=False, demo=False, without_lamp=True,
+                           str_append='_after', store_path=glb_export_root)
 
         bp_box, bp_angle = [], []
         for i in range(len(keep)):
@@ -200,6 +435,29 @@ def validate_constrains_loop_w_changes(modelArgs, testdataset, model, normalized
                 bp_box.append(dec_tight_boxes[i:i+1,:6].cpu().detach())
                 angle = dec_tight_boxes[i:i+1, 6:7] / np.pi * 180
                 bp_angle.append(angle.cpu().detach())
+        if original:
+            with torch.no_grad():
+                keep_flat = keep.view(-1).cpu().numpy().astype(int).tolist()
+                dec_len = len(keep_flat)
+                missing_nodes_list = [int(x) for x in missing_nodes]
+                dec_to_enc = _build_enc_index_map(dec_len, missing_nodes_list)
+                dec_boxes_cpu = boxes_pred_den.detach().cpu()
+                dec_angles_cpu = angles_pred.detach().cpu().view(-1)
+                orig_boxes_cpu = original_boxes_pred.detach().cpu()
+                orig_angles_cpu = original_angles_pred.detach().cpu().view(-1)
+
+                for dec_idx, is_keep in enumerate(keep_flat):
+                    if is_keep != 1:
+                        continue
+                    if dec_idx not in dec_to_enc:
+                        continue
+                    enc_idx = dec_to_enc[dec_idx]
+                    center_l2 = torch.norm(dec_boxes_cpu[dec_idx, 3:6] - orig_boxes_cpu[enc_idx, 3:6], p=2).item()
+                    size_l1 = torch.mean(torch.abs(dec_boxes_cpu[dec_idx, 0:3] - orig_boxes_cpu[enc_idx, 0:3])).item()
+                    angle_abs = _angular_abs_diff(dec_angles_cpu[dec_idx], orig_angles_cpu[enc_idx]).item()
+                    before_after_stats['center_l2'].append(center_l2)
+                    before_after_stats['size_l1'].append(size_l1)
+                    before_after_stats['angle_abs'].append(angle_abs)
 
         all_pred_boxes.append(boxes_pred_den.cpu().detach())
         all_pred_angles.append(angles_pred.cpu().detach())
@@ -229,6 +487,16 @@ def validate_constrains_loop_w_changes(modelArgs, testdataset, model, normalized
                 '{} & L/R: {:.2f} & F/B: {:.2f} & Bi/Sm: {:.2f} & Ta/Sh: {:.2f} & Stand: {:.2f} & Close: {:.2f} & Symm: {:.2f}. Total: &{:.2f}\n'.format(
                     typ, lr_mean, fb_mean, bism_mean, tash_mean, stand_mean, close_mean, symm_mean, total_mean))
             file.write('means of mean: {:.2f}\n\n'.format(means_of_mean))
+    diff_output_path = os.path.join(modelArgs['store_path'], f'{testdataset.eval_type}_before_after_diff.txt')
+    with open(diff_output_path, 'w') as diff_file:
+        for k, values in before_after_stats.items():
+            if len(values) == 0:
+                msg = f'{k}: no matched objects for comparison\n'
+            else:
+                msg = f'{k}: mean={np.mean(values):.4f}, std={np.std(values):.4f}, n={len(values)}\n'
+            print(msg.strip())
+            diff_file.write(msg)
+
 
 
 def validate_constrains_loop(modelArgs, test_dataset, model, epoch=None, normalized_file=None, cat2objs=None, datasize='large', gen_shape=False):
@@ -397,15 +665,15 @@ def evaluate():
 
     print('\nEditing Mode - Additions')
     reseed(47)
-    # validate_constrains_loop_w_changes(modelArgs, test_dataset_addition_changes, model, normalized_file=normalized_file, bin_angles=modelArgs['bin_angle'], cat2objs=cat2objs, datasize='large' if modelArgs['large'] else 'small', gen_shape=args.gen_shape)
+    validate_constrains_loop_w_changes(modelArgs, test_dataset_addition_changes, model, normalized_file=normalized_file, bin_angles=modelArgs['bin_angle'], cat2objs=cat2objs, datasize='large' if modelArgs['large'] else 'small', gen_shape=args.gen_shape)
 
     reseed(47)
     print('\nEditing Mode - Relationship changes')
-    # validate_constrains_loop_w_changes(modelArgs, test_dataset_rels_changes, model,  normalized_file=normalized_file, bin_angles=modelArgs['bin_angle'], cat2objs=cat2objs, datasize='large' if modelArgs['large'] else 'small', gen_shape=args.gen_shape)
+    validate_constrains_loop_w_changes(modelArgs, test_dataset_rels_changes, model,  normalized_file=normalized_file, bin_angles=modelArgs['bin_angle'], cat2objs=cat2objs, datasize='large' if modelArgs['large'] else 'small', gen_shape=args.gen_shape)
 
-    reseed(47)
-    print('\nGeneration Mode')
-    validate_constrains_loop(modelArgs, test_dataset_no_changes, model, epoch=args.epoch, normalized_file=normalized_file, cat2objs=cat2objs, datasize='large' if modelArgs['large'] else 'small', gen_shape=args.gen_shape)
+    # reseed(47)
+    # print('\nGeneration Mode')
+    # validate_constrains_loop(modelArgs, test_dataset_no_changes, model, epoch=args.epoch, normalized_file=normalized_file, cat2objs=cat2objs, datasize='large' if modelArgs['large'] else 'small', gen_shape=args.gen_shape)
 
 if __name__ == "__main__":
     print(torch.__version__)
